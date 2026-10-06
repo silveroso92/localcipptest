@@ -1,0 +1,194 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CIPP – local / on-prem test stack (Proxurve)
+#
+# Runs the SAME container image Azure App Service runs (ghcr.io/cyberdrain/cipp),
+# with Azurite standing in for the Storage Account and the DevSecrets table
+# standing in for Key Vault (CIPP switches to that automatically when
+# NonLocalHostAzurite=true). Nothing in backend/ or frontend/ is modified.
+#
+# Location in repo:  build/local/   (keeps upstream merges conflict-free)
+#
+#   cp .env.example .env   # fill it in
+#   docker compose -f docker-compose.local.yml up -d
+# Which CIPP container runs is chosen by COMPOSE_PROFILES in .env:
+#   image             -> upstream ghcr.io/cyberdrain/cipp image (default)
+#   build             -> image built from YOUR fork (build/Dockerfile.release)
+#   add ,monitoring   -> cAdvisor + Prometheus
+# ─────────────────────────────────────────────────────────────────────────────
+name: cipp-local
+
+x-cipp-env: &cipp-env
+  # Development env = appsettings.Development.json, which we replace with
+  # config/appsettings.Local.json (Production settings + local auth posture).
+  ASPNETCORE_ENVIRONMENT: Development
+  CIPPNG: "true"
+  COMMIT_SHA: ${COMMIT_SHA:--local}
+  AzureWebJobsStorage: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1;
+  # Secrets -> DevSecrets table instead of Key Vault
+  NonLocalHostAzurite: "true"
+  # ── App Service plan simulation (see README "Sizing profiles") ──
+  WEBSITE_SKU: ${SIM_SKU:-Basic}
+  App__Worker__HttpPoolSize: ${HTTP_POOL:-6}
+  App__Worker__BgPoolSize: ${BG_POOL:-8}
+  DOTNET_gcServer: "0"
+  DOTNET_GCHeapHardLimit: ${GC_HEAP_LIMIT:-0x95E00000}
+  App__StatsHistory__SampleIntervalSeconds: "30"
+  # Region-derived default timezone (eastus -> America/New_York)
+  REGION_NAME: ${REGION_NAME:-eastus}
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:${AZURITE_TAG:-latest}
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    # Upstream prestart guard prunes regenerable cache tables if the LokiJS DB
+    # grows too large to load (prevents OOM crash loops).
+    command: >
+      "node /azurite-prestart.js /workspace &&
+      exec azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+      --location /workspace --loose --skipApiVersionCheck --disableTelemetry"
+    environment:
+      AZURITE_ACCOUNTS: devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+      NODE_OPTIONS: --max-old-space-size=${AZURITE_HEAP_MB:-4096}
+      AZURITE_PRESTART_MAX_MB: ${AZURITE_PRESTART_MAX_MB:-300}
+    # Loopback only: reachable from the VM (migration script / Storage Explorer
+    # over SSH tunnel), never from the LAN.
+    ports:
+      - "127.0.0.1:10000:10000"
+      - "127.0.0.1:10001:10001"
+      - "127.0.0.1:10002:10002"
+    volumes:
+      - azurite-data:/workspace
+      - ../tools/azurite-prestart.js:/azurite-prestart.js:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(10002,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [cipp-backend]
+
+  # Upstream release image – identical to what App Service pulls.
+  cipp-api:
+    image: ${CIPP_IMAGE:-ghcr.io/cyberdrain/cipp:latest}
+    platform: linux/amd64
+    restart: unless-stopped
+    profiles: ["image"]
+    environment: *cipp-env
+    # B2 simulation by default: 2 vCPU / 3.5 GB, no swap. Change in .env.
+    cpus: ${SIM_CPUS:-2}
+    mem_limit: ${SIM_MEM:-3584m}
+    memswap_limit: ${SIM_MEM:-3584m}
+    volumes:
+      - ./config/appsettings.Local.json:/app/appsettings.Development.json:ro
+    expose: ["8080"]          # NOT published – only reachable via oauth2-proxy
+    depends_on:
+      azurite: { condition: service_healthy }
+    networks: [cipp-backend]
+
+  # Same as above but built from YOUR fork (build/Dockerfile.release).
+  # Enable with COMPOSE_PROFILES=build (never together with 'image').
+  cipp-api-build:
+    build:
+      context: ../..
+      dockerfile: build/Dockerfile.release
+      args:
+        APP_VERSION: ${APP_VERSION:-0.0.0-local}
+        COMMIT_SHA: ${COMMIT_SHA:-local}
+        IMAGE_TAG: local
+    image: proxurve/cipp:local
+    platform: linux/amd64
+    restart: unless-stopped
+    profiles: ["build"]
+    environment: *cipp-env
+    cpus: ${SIM_CPUS:-2}
+    mem_limit: ${SIM_MEM:-3584m}
+    memswap_limit: ${SIM_MEM:-3584m}
+    volumes:
+      - ./config/appsettings.Local.json:/app/appsettings.Development.json:ro
+    expose: ["8080"]
+    depends_on:
+      azurite: { condition: service_healthy }
+    networks:
+      cipp-backend:
+        aliases: [cipp-api]   # oauth2-proxy upstream stays the same
+
+  # Entra ID sign-in in front of CIPP (CIPP itself runs AllowAnonymous locally).
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:${OAUTH2_PROXY_TAG:-v7.8.1}
+    restart: unless-stopped
+    environment:
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0
+      OAUTH2_PROXY_CLIENT_ID: ${ENTRA_CLIENT_ID}
+      OAUTH2_PROXY_CLIENT_SECRET: ${ENTRA_CLIENT_SECRET}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_COOKIE_SECRET}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_NAME: _cipp_local
+      OAUTH2_PROXY_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-*}
+      OAUTH2_PROXY_ALLOWED_GROUPS: ${ALLOWED_GROUP_IDS:-}
+      OAUTH2_PROXY_SCOPE: openid profile email
+      OAUTH2_PROXY_REDIRECT_URL: https://${CIPP_HOSTNAME}/oauth2/callback
+      OAUTH2_PROXY_UPSTREAMS: http://cipp-api:8080/
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      # CIPP's own public endpoints (same list App Service excludes from EasyAuth)
+      OAUTH2_PROXY_SKIP_AUTH_ROUTES: (?i)^/api/(publicping|publicwebhooks|publicphishingcheck)
+      OAUTH2_PROXY_UPSTREAM_TIMEOUT: 660s
+    networks: [cipp-backend, cipp-edge]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${HTTPS_BIND:-0.0.0.0}:443:443"
+      - "${HTTPS_BIND:-0.0.0.0}:80:80"
+    environment:
+      CIPP_HOSTNAME: ${CIPP_HOSTNAME}
+      CADDY_TLS: ${CADDY_TLS:-internal}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [oauth2-proxy]
+    networks: [cipp-edge]
+
+  # ── Optional metrics (profile: monitoring) ──
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:${CADVISOR_TAG:-v0.49.1}
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks: [cipp-monitor]
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_TAG:-latest}
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=${METRICS_RETENTION:-45d}
+    ports:
+      - "127.0.0.1:9090:9090"   # SSH-tunnel to view
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [cipp-monitor]
+
+volumes:
+  azurite-data:
+  caddy-data:
+  caddy-config:
+  prometheus-data:
+
+networks:
+  cipp-backend:
+    internal: false   # cipp-api needs outbound HTTPS to Graph/login.microsoftonline.com
+  cipp-edge:
+  cipp-monitor:

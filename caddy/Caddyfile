@@ -1,0 +1,33 @@
+{
+	# admin API off – nothing needs it
+	admin off
+}
+
+{$CIPP_HOSTNAME} {
+	tls {$CADDY_TLS}
+
+	encode zstd gzip
+
+	# CIPP requests can run up to ~11 min (Kestrel 660s timeout)
+	reverse_proxy oauth2-proxy:4180 {
+		transport http {
+			read_timeout 700s
+			write_timeout 700s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format json
+	}
+}
